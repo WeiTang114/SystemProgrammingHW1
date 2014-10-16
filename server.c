@@ -11,6 +11,12 @@
 
 #define ERR_EXIT(a) { perror(a); exit(1); }
 
+#ifdef DEBUG
+    #define DPRINTF(format, args...) printf("[%s:%d] "format, __FILE__, __LINE__, ##args)
+#else
+    #define DPRINTF(args...)
+#endif
+
 typedef struct {
     char hostname[512];  // server's hostname
     unsigned short port;  // port to listen
@@ -27,6 +33,13 @@ typedef struct {
     int wait_for_write;  // used by handle_read to know if the header is read or not.
 } request;
 
+typedef struct {
+    int id;
+    int money;
+    int rw;  // when one deposits / withdraws, rw = -1; when one reads, rw ++
+} Account;
+
+
 server svr;  // server
 request* requestP = NULL;  // point to a list of requests
 int maxfd;  // size of open file descriptor table, size of request list
@@ -36,6 +49,10 @@ const char* accept_write_header = "ACCEPT_FROM_WRITE";
 const char* reject_header = "REJECT\n";
 
 // Forwards
+
+static int handle_svrsock();
+static int handle_clientsock(int conn_fd);
+
 
 static void init_server(unsigned short port);
 // initailize a server, exit for error
@@ -56,12 +73,9 @@ static int handle_read(request* reqP);
 int main(int argc, char** argv) {
     int i, ret;
 
-    struct sockaddr_in cliaddr;  // used by accept()
-    int clilen;
 
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
-    char buf[512];
     int buf_len;
 
     // Parse args.
@@ -88,44 +102,134 @@ int main(int argc, char** argv) {
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
+
+    fd_set master_set;
+    fd_set read_set;
+
+    struct timeval timeout_interval;
+    int read_max_fd = 0;
+
+
+    FD_ZERO(&master_set);
+    FD_SET(svr.listen_fd, &master_set);   
+    read_max_fd = svr.listen_fd;
+
     while (1) {
         // TODO: Add IO multiplexing
-        // Check new connection
-        clilen = sizeof(cliaddr);
-        conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
-        if (conn_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;  // try again
-            if (errno == ENFILE) {
-                (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
-                continue;
-            }
-            ERR_EXIT("accept")
+        timeout_interval.tv_sec = 2;
+        timeout_interval.tv_usec = 500000;
+        DPRINTF("read_max_fd=%d\n", read_max_fd);
+
+        // select modifies read_set as the argument, so we need a clean one, master.
+        read_set = master_set;
+
+        ret = select(read_max_fd + 1, &read_set, NULL, NULL, &timeout_interval);// NULL);ss
+        if (-1 == ret) {
+            perror ("select");
+            continue;   
         }
-        requestP[conn_fd].conn_fd = conn_fd;
-        strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+        else if (0 == ret) {
+            continue;
+        }
+        else {
+            DPRINTF("something selected, num = %d\n", ret);
+            int res;
+            int j;
+            for (j = 0; j < 8 /*FD_SETSIZE*/; j++) {
+                if (FD_ISSET(j, &read_set)) {
+                    if (j == svr.listen_fd) {
+                        res = handle_svrsock();
+                        if (res < 0) {
+                            printf("handle_svrsock failed, return %d\n", res);
+                        }
+                        else { // new clients
+                            FD_SET(res, &master_set);
+                            read_max_fd = read_max_fd >= res ? read_max_fd : res;
+                            DPRINTF("new client added to read_set: %d\n", res);
+                        }
+                        break;
+                    }
+                    else {
+                        res = handle_clientsock(j);
+                        if (res < 0) {
+                            printf("handle_clientsock failed\n");
+                        }
+                        else if (0 == res) {
+                            DPRINTF("closing client %d\n", j);
+                            FD_CLR(j, &master_set);
+                            close(j);
+                            free_request(&requestP[j]);
+                        }
+                    }
+                }
+            }
+        }
 
-
-		ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
-		if (ret < 0) {
-			fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
-			continue;
-		}
-
-#ifdef READ_SERVER
-		sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
-		write(requestP[conn_fd].conn_fd, buf, strlen(buf));
-#else
-		sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
-		write(requestP[conn_fd].conn_fd, buf, strlen(buf));
-#endif
-
-		close(requestP[conn_fd].conn_fd);
-		free_request(&requestP[conn_fd]);
     }
     free(requestP);
     return 0;
 }
+
+
+
+
+/**
+ * server socket selected, must accept
+ * @return positive number: fd accepted
+ */
+static int handle_svrsock()
+{
+    //TODO
+ 
+    int clilen = 0;
+    struct sockaddr_in cliaddr;  // used by accept()
+    int conn_fd = 0;
+    // Check new connection
+    clilen = sizeof(cliaddr);
+    conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
+    if (conn_fd < 0) {
+        if (errno == EINTR || errno == EAGAIN) return -1;  // try again
+        if (errno == ENFILE) {
+            (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
+            return -2;
+        }
+        ERR_EXIT("accept")
+    }
+    requestP[conn_fd].conn_fd = conn_fd;
+    strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
+    fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+
+    return conn_fd;
+}
+
+static int handle_clientsock(int conn_fd)
+{
+    printf("handle_clientsock called, conn_fd = %d\n", conn_fd);
+
+    //TODO
+    int ret = 0;
+    char buf[512];
+    
+    ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
+    if (ret < 0) {
+        fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
+        return -1;
+    }
+    DPRINTF("ret(handle_read) = %d\n", ret);
+
+#ifdef READ_SERVER
+    sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
+    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+#else
+    sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
+    write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+#endif
+
+    return 0;
+}
+
+
+
 
 
 // ======================================================================================================
