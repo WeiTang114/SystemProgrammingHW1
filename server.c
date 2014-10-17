@@ -10,7 +10,7 @@
 #include <netdb.h>
 
 #define ERR_EXIT(a) { perror(a); exit(1); }
-
+#define ACCT_PATH "./account_info"
 #ifdef DEBUG
     #define DPRINTF(format, args...) printf("[%s:%d] "format, __FILE__, __LINE__, ##args)
 #else
@@ -29,7 +29,7 @@ typedef struct {
     char buf[512];  // data sent by/to client
     size_t buf_len;  // bytes used by buf
     // you don't need to change this.
-	int account;
+    int account;
     int wait_for_write;  // used by handle_read to know if the header is read or not.
 } request;
 
@@ -52,6 +52,12 @@ const char* reject_header = "REJECT\n";
 
 static int handle_svrsock();
 static int handle_clientsock(int conn_fd);
+static int hextal_str2int(char* hexstr);
+static int hextal_int2str(int hexint, char* hexstrbuf);
+static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf);
+static int lock_account(int acct_id, int type);
+static int unlock_account(int acct_id, int type);
+static int read_account(int acct_id, char* msg_buf);
 
 
 static void init_server(unsigned short port);
@@ -118,7 +124,7 @@ int main(int argc, char** argv) {
         // TODO: Add IO multiplexing
         timeout_interval.tv_sec = 2;
         timeout_interval.tv_usec = 500000;
-        DPRINTF("read_max_fd=%d\n", read_max_fd);
+        //DPRINTF("read_max_fd=%d\n", read_max_fd);
 
         // select modifies read_set as the argument, so we need a clean one, master.
         read_set = master_set;
@@ -128,38 +134,37 @@ int main(int argc, char** argv) {
             perror ("select");
             continue;   
         }
-        else if (0 == ret) {
+        else if (0 == ret) { //timeout
             continue;
         }
-        else {
-            DPRINTF("something selected, num = %d\n", ret);
-            int res;
-            int j;
-            for (j = 0; j < 8 /*FD_SETSIZE*/; j++) {
-                if (FD_ISSET(j, &read_set)) {
-                    if (j == svr.listen_fd) {
-                        res = handle_svrsock();
-                        if (res < 0) {
-                            printf("handle_svrsock failed, return %d\n", res);
-                        }
-                        else { // new clients
-                            FD_SET(res, &master_set);
-                            read_max_fd = read_max_fd >= res ? read_max_fd : res;
-                            DPRINTF("new client added to read_set: %d\n", res);
-                        }
-                        break;
+
+        DPRINTF("something selected, num = %d\n", ret);
+        int res;
+        int j;
+        for (j = 0; j < 8 /*FD_SETSIZE*/; j++) {
+            if (FD_ISSET(j, &read_set)) {
+                if (j == svr.listen_fd) {
+                    res = handle_svrsock();
+                    if (res < 0) {
+                        printf("handle_svrsock failed, return %d\n", res);
                     }
-                    else {
-                        res = handle_clientsock(j);
-                        if (res < 0) {
-                            printf("handle_clientsock failed\n");
-                        }
-                        else if (0 == res) {
-                            DPRINTF("closing client %d\n", j);
-                            FD_CLR(j, &master_set);
-                            close(j);
-                            free_request(&requestP[j]);
-                        }
+                    else { // new clients
+                        FD_SET(res, &master_set);
+                        read_max_fd = read_max_fd >= res ? read_max_fd : res;
+                        DPRINTF("new client added to read_set: %d\n", res);
+                    }
+                    break;
+                }
+                else {
+                    res = handle_clientsock(j);
+                    if (res < 0) {
+                        printf("handle_clientsock failed\n");
+                    }
+                    else if (0 == res) {
+                        DPRINTF("closing client %d\n", j);
+                        FD_CLR(j, &master_set);
+                        close(j);
+                        free_request(&requestP[j]);
                     }
                 }
             }
@@ -218,7 +223,8 @@ static int handle_clientsock(int conn_fd)
     DPRINTF("ret(handle_read) = %d\n", ret);
 
 #ifdef READ_SERVER
-    sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
+    //sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
+    read_account(6, buf);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #else
     sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
@@ -229,6 +235,109 @@ static int handle_clientsock(int conn_fd)
 }
 
 
+/**
+ * [read_account description]
+ * @param  acct_id [description]
+ * @return         0: success  -1: occupied -2: other error
+ */
+static int read_account(int acct_id, char* msg_buf)
+{
+    int money = 0;
+    char read_buf[64];
+    int acct_fd = -1;
+    FILE *fp;
+    int acct_offset = -1;
+    int acct_buf[2] = {0, 0};
+
+    if (lock_account(acct_id, 0) == -1) {
+        // failed
+        DPRINTF("read_account: %d failed: occupied\n", acct_id);
+        sprintf(msg_buf, "This account is occupied.");
+        return -1;
+    }
+
+    if ((acct_fd = open(ACCT_PATH, O_RDONLY)) == -1) {
+        perror("Open account file for reading");
+        return -2;
+    }
+
+    fp = fdopen(acct_fd, "r");
+
+    acct_offset = get_account_offset(acct_id, fp, acct_buf);
+    if (acct_offset < 0) {
+        printf("Error: acct_idx:%d not found\n", acct_offset);
+        fclose(fp);
+        return -2;
+    }
+   
+    money = acct_buf[1];
+    DPRINTF("money = %d\n", money);
+    sprintf(msg_buf, "Balance: %d\n", money);
+
+    fclose(fp);
+    unlock_account(acct_id, 0);
+
+    return 0;
+}
+
+/**
+ * [write_account description]
+ * @param  acct_id [description]
+ * @param  dvalue  [description]
+ * @return         -1: occupied -2: op failed
+ */
+static int write_account(int acct_id, int dvalue)
+{
+    // TODO
+    return -1;
+}
+
+
+/**
+ * [lock_account description]
+ * @param  acct_id [description]
+ * @param  type    0:read 1:write
+ * @return         0: success  -1: fail
+ */
+static int lock_account(int acct_id, int type)
+{
+    return 0;
+}
+
+/**
+ * [unlock_account description]
+ * @param  acct_id [description]
+ * @param  type    0:read  1:write
+ * @return         0: success  -1:fail
+ */
+static int unlock_account(int acct_id, int type)
+{
+    return 0;
+}
+
+
+static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
+{
+    char *p = 0;
+    long offset = -1;
+    int buf[2] = {0,0};
+
+    if (acct_id <= 0) 
+        return -1;
+
+    fseek(acct_fp, 0, SEEK_SET);
+    while (fread(buf, sizeof(int), 2, acct_fp) != 0) {
+        if (acct_id == buf[0]) {
+            if (acct_buf) {
+                memcpy(acct_buf, buf, 2 * sizeof(int));
+            }
+            break;
+        }
+        offset += 8;
+    }
+    fseek(acct_fp, 0, SEEK_SET);
+    return offset;
+}
 
 
 
@@ -267,20 +376,20 @@ static int handle_read(request* reqP) {
     r = read(reqP->conn_fd, buf, sizeof(buf));
     if (r < 0) return -1;
     if (r == 0) return 0;
-	char* p1 = strstr(buf, "\015\012");
-	int newline_len = 2;
-	// be careful that in Windows, line ends with \015\012
-	if (p1 == NULL) {
-		p1 = strstr(buf, "\012");
-		newline_len = 1;
-		if (p1 == NULL) {
-			ERR_EXIT("this really should not happen...");
-		}
-	}
-	size_t len = p1 - buf + 1;
-	memmove(reqP->buf, buf, len);
-	reqP->buf[len - 1] = '\0';
-	reqP->buf_len = len-1;
+    char* p1 = strstr(buf, "\015\012");
+    int newline_len = 2;
+    // be careful that in Windows, line ends with \015\012
+    if (p1 == NULL) {
+        p1 = strstr(buf, "\012");
+        newline_len = 1;
+        if (p1 == NULL) {
+            ERR_EXIT("this really should not happen...");
+        }
+    }
+    size_t len = p1 - buf + 1;
+    memmove(reqP->buf, buf, len);
+    reqP->buf[len - 1] = '\0';
+    reqP->buf_len = len-1;
     return 1;
 }
 
