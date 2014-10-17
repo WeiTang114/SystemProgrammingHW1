@@ -57,8 +57,8 @@ static int hextal_int2str(int hexint, char* hexstrbuf);
 static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf);
 static int lock_account(int acct_id, int type);
 static int unlock_account(int acct_id, int type);
-static int read_account(int acct_id, char* msg_buf);
-
+static int read_account(int acct_id);
+static int write_account(int acct_id, int dvalue);
 
 static void init_server(unsigned short port);
 // initailize a server, exit for error
@@ -221,12 +221,27 @@ static int handle_clientsock(int conn_fd)
         return -1;
     }
     DPRINTF("ret(handle_read) = %d\n", ret);
-
+    int money;
 #ifdef READ_SERVER
     //sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
-    read_account(6, buf);
+    money = read_account(6);
+    if (money == -1) 
+        sprintf(buf, "This account is occupied.\n");
+    else
+        sprintf(buf, "Balance: %d\n", money);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #else
+
+    /* TEST
+    money = write_account(6, 200);
+    if (-1 == money)
+        sprintf(buf, "This account is occupied.\n");
+    else if (-2 == money)
+        sprintf(buf, "Operation fail.\n");
+    else
+        sprintf(buf, "%d\n", money);
+    */
+   
     sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #endif
@@ -238,12 +253,11 @@ static int handle_clientsock(int conn_fd)
 /**
  * [read_account description]
  * @param  acct_id [description]
- * @return         0: success  -1: occupied -2: other error
+ * @return         >=0: value  -1: occupied -2: other error
  */
-static int read_account(int acct_id, char* msg_buf)
+static int read_account(int acct_id)
 {
     int money = 0;
-    char read_buf[64];
     int acct_fd = -1;
     FILE *fp;
     int acct_offset = -1;
@@ -252,7 +266,6 @@ static int read_account(int acct_id, char* msg_buf)
     if (lock_account(acct_id, 0) == -1) {
         // failed
         DPRINTF("read_account: %d failed: occupied\n", acct_id);
-        sprintf(msg_buf, "This account is occupied.");
         return -1;
     }
 
@@ -272,24 +285,65 @@ static int read_account(int acct_id, char* msg_buf)
    
     money = acct_buf[1];
     DPRINTF("money = %d\n", money);
-    sprintf(msg_buf, "Balance: %d\n", money);
 
     fclose(fp);
     unlock_account(acct_id, 0);
 
-    return 0;
+    return money;
 }
 
 /**
  * [write_account description]
  * @param  acct_id [description]
  * @param  dvalue  [description]
- * @return         -1: occupied -2: op failed
+ * @return         -1: occupied -2: op failed  -3:other fail
  */
 static int write_account(int acct_id, int dvalue)
 {
-    // TODO
-    return -1;
+    int money = 0;
+    int acct_fd = -1;
+    FILE *fp;
+    int acct_offset = -1;
+    int acct_buf[2] = {0, 0};
+
+    if (lock_account(acct_id, 1) == -1) {
+        // failed
+        DPRINTF("write_account: %d failed: occupied\n", acct_id);
+        return -1;
+    }
+
+    if ((acct_fd = open(ACCT_PATH, O_RDWR)) == -1) {
+        perror("Open account file for reading");
+        return -3;
+    }
+
+    fp = fdopen(acct_fd, "r+");
+
+    acct_offset = get_account_offset(acct_id, fp, acct_buf);
+    if (acct_offset < 0) {
+        printf("Error: acct_idx:%d not found\n", acct_offset);
+        fclose(fp);
+        return -3;
+    }
+   
+    money = acct_buf[1];
+    DPRINTF("money = %d\n", money);
+
+    if (money + dvalue < 0) {
+        DPRINTF("money(%d) + dvalue(%d) < 0\n", money, dvalue);
+        fclose(fp);
+        return -2;
+    }
+
+    money += dvalue;
+    fseek(fp, acct_offset + 4, SEEK_SET);
+    fwrite(&money, sizeof(int), 1, fp);
+    DPRINTF("Write to account %d : %d  (acct_offset = %d)\n", acct_id, money, acct_offset);
+
+    fclose(fp);
+    unlock_account(acct_id, 1);
+
+    return money;
 }
 
 
@@ -319,7 +373,8 @@ static int unlock_account(int acct_id, int type)
 static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
 {
     char *p = 0;
-    long offset = -1;
+    int found = 0;
+    long offset = 0;
     int buf[2] = {0,0};
 
     if (acct_id <= 0) 
@@ -327,7 +382,9 @@ static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
 
     fseek(acct_fp, 0, SEEK_SET);
     while (fread(buf, sizeof(int), 2, acct_fp) != 0) {
+        printf("%d %d\n", buf[0], buf[1]);
         if (acct_id == buf[0]) {
+            found = 1;
             if (acct_buf) {
                 memcpy(acct_buf, buf, 2 * sizeof(int));
             }
@@ -336,6 +393,11 @@ static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
         offset += 8;
     }
     fseek(acct_fp, 0, SEEK_SET);
+    if (!found){
+        return -1;
+    }
+
+    printf("get_account_offset:%ld\n", offset);
     return offset;
 }
 
