@@ -52,13 +52,12 @@ const char* reject_header = "REJECT\n";
 
 static int handle_svrsock();
 static int handle_clientsock(int conn_fd);
-static int hextal_str2int(char* hexstr);
-static int hextal_int2str(int hexint, char* hexstrbuf);
 static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf);
 static int lock_account(int acct_id, int type);
 static int unlock_account(int acct_id, int type);
 static int read_account(int acct_id);
 static int write_account(int acct_id, int dvalue);
+static int acquire_write_acct(int acct_id);
 
 static void init_server(unsigned short port);
 // initailize a server, exit for error
@@ -166,6 +165,9 @@ int main(int argc, char** argv) {
                         close(j);
                         free_request(&requestP[j]);
                     }
+                    else if (1 == res) {
+                        DPRINTF("Wait for client..%d\n", j);
+                    }
                 }
             }
         }
@@ -214,6 +216,7 @@ static int handle_clientsock(int conn_fd)
     //TODO
     int ret = 0;
     char buf[512];
+    int retval = 0;
     
     ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
     if (ret < 0) {
@@ -230,7 +233,42 @@ static int handle_clientsock(int conn_fd)
     else
         sprintf(buf, "Balance: %d\n", money);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+    retval = 0;
 #else
+
+    int input = atoi(requestP[conn_fd].buf);
+
+    if (0 == requestP[conn_fd].wait_for_write) {
+        if (acquire_write_acct(input) == 0) {
+            requestP[conn_fd].wait_for_write = 1;
+            requestP[conn_fd].account = input;
+            sprintf(buf, "This account is available.\n");
+            DPRINTF("acquired account %d by %d, success\n", input, conn_fd);
+            retval = 1;
+        }
+        else {
+            sprintf(buf, "This account is occupied.\n");
+            DPRINTF("acquired account %d by %d, occupied\n", input, conn_fd);
+            retval = 0;
+        }
+    }
+    else {
+        money = write_account(requestP[conn_fd].account, input);
+        if (-2 == money) {
+            sprintf(buf, "Operation fail.\n");
+            DPRINTF("Operation failed.\n");
+        }
+        else if (money >= 0) {
+            buf[0] = '\0';
+            DPRINTF("Write finish.\n");
+        }
+        else {
+            sprintf(buf, "Unexpected error: money = %d\n", money);
+            DPRINTF("Unexpected error: money = %d\n", money);
+        }
+        retval = 0;
+    }
+
 
     /* TEST
     money = write_account(6, 200);
@@ -242,11 +280,11 @@ static int handle_clientsock(int conn_fd)
         sprintf(buf, "%d\n", money);
     */
    
-    sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
+    //sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #endif
 
-    return 0;
+    return retval;
 }
 
 
@@ -292,6 +330,17 @@ static int read_account(int acct_id)
     return money;
 }
 
+static int acquire_write_acct(int acct_id)
+{
+    if (lock_account(acct_id, 1) == -1) {
+        // failed
+        DPRINTF("acquire_write_account: %d failed: occupied\n", acct_id);
+        return -1;
+    }
+    return 0;
+}
+
+
 /**
  * [write_account description]
  * @param  acct_id [description]
@@ -305,12 +354,6 @@ static int write_account(int acct_id, int dvalue)
     FILE *fp;
     int acct_offset = -1;
     int acct_buf[2] = {0, 0};
-
-    if (lock_account(acct_id, 1) == -1) {
-        // failed
-        DPRINTF("write_account: %d failed: occupied\n", acct_id);
-        return -1;
-    }
 
     if ((acct_fd = open(ACCT_PATH, O_RDWR)) == -1) {
         perror("Open account file for reading");
