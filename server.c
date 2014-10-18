@@ -31,6 +31,7 @@ typedef struct {
     // you don't need to change this.
     int account;
     int wait_for_write;  // used by handle_read to know if the header is read or not.
+    int fd_towrite;
 } request;
 
 typedef struct {
@@ -53,10 +54,10 @@ const char* reject_header = "REJECT\n";
 static int handle_svrsock();
 static int handle_clientsock(int conn_fd);
 static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf);
-static int lock_account(int acct_id, int type);
-static int unlock_account(int acct_id, int type);
+static int lock_account(int acct_id, int type, int acct_fd);
+static int unlock_account(int acct_id, int type, int acct_fd);
 static int read_account(int acct_id);
-static int write_account(int acct_id, int dvalue);
+static int write_account(int acct_id, int dvalue, int fd_towrite);
 static int acquire_write_acct(int acct_id);
 
 static void init_server(unsigned short port);
@@ -225,9 +226,10 @@ static int handle_clientsock(int conn_fd)
     }
     DPRINTF("ret(handle_read) = %d\n", ret);
     int money;
+    int input = atoi(requestP[conn_fd].buf);
 #ifdef READ_SERVER
     //sprintf(buf,"%s : %s\n",accept_read_header,requestP[conn_fd].buf);
-    money = read_account(6);
+    money = read_account(input);
     if (money == -1) 
         sprintf(buf, "This account is occupied.\n");
     else
@@ -235,25 +237,24 @@ static int handle_clientsock(int conn_fd)
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
     retval = 0;
 #else
-
-    int input = atoi(requestP[conn_fd].buf);
-
     if (0 == requestP[conn_fd].wait_for_write) {
-        if (acquire_write_acct(input) == 0) {
+        int acquired_fd;
+        if ((acquired_fd = acquire_write_acct(input)) > 0) {
             requestP[conn_fd].wait_for_write = 1;
             requestP[conn_fd].account = input;
+            requestP[conn_fd].fd_towrite = acquired_fd;
             sprintf(buf, "This account is available.\n");
             DPRINTF("acquired account %d by %d, success\n", input, conn_fd);
             retval = 1;
         }
-        else {
+        else if (-1 == acquired_fd) {
             sprintf(buf, "This account is occupied.\n");
             DPRINTF("acquired account %d by %d, occupied\n", input, conn_fd);
             retval = 0;
         }
     }
     else {
-        money = write_account(requestP[conn_fd].account, input);
+        money = write_account(requestP[conn_fd].account, input, requestP[conn_fd].fd_towrite);
         if (-2 == money) {
             sprintf(buf, "Operation fail.\n");
             DPRINTF("Operation failed.\n");
@@ -301,15 +302,16 @@ static int read_account(int acct_id)
     int acct_offset = -1;
     int acct_buf[2] = {0, 0};
 
-    if (lock_account(acct_id, 0) == -1) {
-        // failed
-        DPRINTF("read_account: %d failed: occupied\n", acct_id);
-        return -1;
-    }
 
     if ((acct_fd = open(ACCT_PATH, O_RDONLY)) == -1) {
         perror("Open account file for reading");
         return -2;
+    }
+
+    if (lock_account(acct_id, 0, acct_fd) == -1) {
+        // failed
+        DPRINTF("read_account: %d failed: occupied\n", acct_id);
+        return -1;
     }
 
     fp = fdopen(acct_fd, "r");
@@ -324,20 +326,27 @@ static int read_account(int acct_id)
     money = acct_buf[1];
     DPRINTF("money = %d\n", money);
 
+    unlock_account(acct_id, 0, acct_fd);
     fclose(fp);
-    unlock_account(acct_id, 0);
 
     return money;
 }
 
 static int acquire_write_acct(int acct_id)
 {
-    if (lock_account(acct_id, 1) == -1) {
+    int acct_fd = -1;
+
+    if ((acct_fd = open(ACCT_PATH, O_RDWR)) == -1) {
+        perror("Open account file for reading");
+        return -2;
+    }
+
+    if (lock_account(acct_id, 1, acct_fd) == -1) {
         // failed
         DPRINTF("acquire_write_account: %d failed: occupied\n", acct_id);
         return -1;
     }
-    return 0;
+    return acct_fd;
 }
 
 
@@ -347,18 +356,13 @@ static int acquire_write_acct(int acct_id)
  * @param  dvalue  [description]
  * @return         -1: occupied -2: op failed  -3:other fail
  */
-static int write_account(int acct_id, int dvalue)
+static int write_account(int acct_id, int dvalue, int fd_towrite)
 {
     int money = 0;
-    int acct_fd = -1;
+    int acct_fd = fd_towrite;
     FILE *fp;
     int acct_offset = -1;
     int acct_buf[2] = {0, 0};
-
-    if ((acct_fd = open(ACCT_PATH, O_RDWR)) == -1) {
-        perror("Open account file for reading");
-        return -3;
-    }
 
     fp = fdopen(acct_fd, "r+");
 
@@ -383,9 +387,8 @@ static int write_account(int acct_id, int dvalue)
     fwrite(&money, sizeof(int), 1, fp);
     DPRINTF("Write to account %d : %d  (acct_offset = %d)\n", acct_id, money, acct_offset);
 
+    unlock_account(acct_id, 1, acct_fd);
     fclose(fp);
-    unlock_account(acct_id, 1);
-
     return money;
 }
 
@@ -396,8 +399,11 @@ static int write_account(int acct_id, int dvalue)
  * @param  type    0:read 1:write
  * @return         0: success  -1: fail
  */
-static int lock_account(int acct_id, int type)
+static int lock_account(int acct_id, int type, int acct_fd)
 {
+
+
+
     return 0;
 }
 
@@ -407,7 +413,7 @@ static int lock_account(int acct_id, int type)
  * @param  type    0:read  1:write
  * @return         0: success  -1:fail
  */
-static int unlock_account(int acct_id, int type)
+static int unlock_account(int acct_id, int type, int acct_fd)
 {
     return 0;
 }
@@ -425,7 +431,6 @@ static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
 
     fseek(acct_fp, 0, SEEK_SET);
     while (fread(buf, sizeof(int), 2, acct_fp) != 0) {
-        printf("%d %d\n", buf[0], buf[1]);
         if (acct_id == buf[0]) {
             found = 1;
             if (acct_buf) {
