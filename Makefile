@@ -1,5 +1,5 @@
 ifdef DEBUG
-	CFLAGS = -DDEBUG
+	CFLAGS = -DDEBUG -g
 else
 	CFLAGS = 
 endif

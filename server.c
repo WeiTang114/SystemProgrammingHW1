@@ -16,6 +16,15 @@
 #else
     #define DPRINTF(args...)
 #endif
+#define MAX_ACCT_ID 127
+
+#define read_lock(fd, offset, whence, len) \
+            lock_reg((fd), F_SETLK, F_RDLCK, (offset), (whence), (len))
+#define write_lock(fd, offset, whence, len) \
+            lock_reg((fd), F_SETLK, F_WRLCK, (offset), (whence), (len))
+#define un_lock(fd, offset, whence, len) \
+            lock_reg((fd), F_SETLK, F_UNLCK, (offset), (whence), (len))
+
 
 typedef struct {
     char hostname[512];  // server's hostname
@@ -44,6 +53,8 @@ typedef struct {
 server svr;  // server
 request* requestP = NULL;  // point to a list of requests
 int maxfd;  // size of open file descriptor table, size of request list
+Account* accountP = NULL;
+
 
 const char* accept_read_header = "ACCEPT_FROM_READ";
 const char* accept_write_header = "ACCEPT_FROM_WRITE";
@@ -59,6 +70,7 @@ static int unlock_account(int acct_id, int type, int acct_fd);
 static int read_account(int acct_id);
 static int write_account(int acct_id, int dvalue, int fd_towrite);
 static int acquire_write_acct(int acct_id);
+int lock_reg(int fd, int cmd, int type, off_t offset, int whence, off_t len);
 
 static void init_server(unsigned short port);
 // initailize a server, exit for error
@@ -92,6 +104,9 @@ int main(int argc, char** argv) {
 
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
+
+
+    accountP = (Account*) calloc(MAX_ACCT_ID + 1, sizeof(Account));
 
     // Get file descripter table size and initize request table
     maxfd = getdtablesize();
@@ -269,19 +284,6 @@ static int handle_clientsock(int conn_fd)
         }
         retval = 0;
     }
-
-
-    /* TEST
-    money = write_account(6, 200);
-    if (-1 == money)
-        sprintf(buf, "This account is occupied.\n");
-    else if (-2 == money)
-        sprintf(buf, "Operation fail.\n");
-    else
-        sprintf(buf, "%d\n", money);
-    */
-   
-    //sprintf(buf,"%s : %s\n",accept_write_header,requestP[conn_fd].buf);
     write(requestP[conn_fd].conn_fd, buf, strlen(buf));
 #endif
 
@@ -308,7 +310,7 @@ static int read_account(int acct_id)
         return -2;
     }
 
-    if (lock_account(acct_id, 0, acct_fd) == -1) {
+    if (lock_account(acct_id, 0, acct_fd) != 0) {
         // failed
         DPRINTF("read_account: %d failed: occupied\n", acct_id);
         return -1;
@@ -341,11 +343,12 @@ static int acquire_write_acct(int acct_id)
         return -2;
     }
 
-    if (lock_account(acct_id, 1, acct_fd) == -1) {
+    if (lock_account(acct_id, 1, acct_fd) != 0) {
         // failed
         DPRINTF("acquire_write_account: %d failed: occupied\n", acct_id);
         return -1;
     }
+
     return acct_fd;
 }
 
@@ -401,9 +404,38 @@ static int write_account(int acct_id, int dvalue, int fd_towrite)
  */
 static int lock_account(int acct_id, int type, int acct_fd)
 {
+    int lockres = 0;
+    int rwtmp = accountP[acct_id].rw;
+    int acct_fd_dup = dup(acct_fd);
+    FILE* fp = fdopen(acct_fd_dup, "r");
+    int acct_offset = get_account_offset(acct_id, fp, NULL);
+    fclose(fp);
 
+    if (0 == type) {
+        if (accountP[acct_id].rw >= 0) {
+            lockres = read_lock(acct_fd, acct_offset, SEEK_SET, 8);
+            accountP[acct_id].rw ++;
+        }
+        else {
+            lockres = -1;    
+        }
+    }
+    else if (1 == type) {
+        if (accountP[acct_id].rw == 0) {
+            lockres = write_lock(acct_fd, acct_offset, SEEK_SET, 8);
+            accountP[acct_id].rw = -1;
+            DPRINTF("write_lock on acct_id %d\n", acct_id);
+        }
+        else {
+            lockres = -1;
+        }
+    }
 
-
+    DPRINTF("lockres = %d\n", lockres);
+    if (lockres != 0) {
+        accountP[acct_id].rw = rwtmp;
+        return -1;
+    }
     return 0;
 }
 
@@ -415,6 +447,22 @@ static int lock_account(int acct_id, int type, int acct_fd)
  */
 static int unlock_account(int acct_id, int type, int acct_fd)
 {
+    int lockres = 0;
+    int acct_fd_dup = dup(acct_fd);
+    FILE* fp = fdopen(acct_fd_dup, "r");
+    int acct_offset = get_account_offset(acct_id, fp, NULL);
+    fclose(fp);
+    DPRINTF("acct_offset = %d\n", acct_offset);
+    lockres = un_lock(acct_fd, acct_offset, SEEK_SET, 8);
+    if (0 == type) {
+        accountP[acct_id].rw --;
+    }
+    else if (1 == type) {
+        accountP[acct_id].rw = 0;
+    }
+
+    if (lockres != 0)
+        return -1;
     return 0;
 }
 
@@ -444,9 +492,17 @@ static long get_account_offset(int acct_id, FILE* acct_fp, int* acct_buf)
     if (!found){
         return -1;
     }
-
-    printf("get_account_offset:%ld\n", offset);
     return offset;
+}
+
+int lock_reg(int fd, int cmd, int type, off_t offset, int whence, off_t len)
+{
+    struct flock lock;
+    lock.l_type = type;
+    lock.l_start = offset;
+    lock.l_whence = whence;
+    lock.l_len = len;
+    return (fcntl(fd, cmd, &lock));
 }
 
 
