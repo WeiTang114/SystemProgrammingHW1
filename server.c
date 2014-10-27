@@ -381,6 +381,7 @@ static int write_account(int acct_id, int dvalue, int fd_towrite)
 
     if (money + dvalue < 0) {
         DPRINTF("money(%d) + dvalue(%d) < 0\n", money, dvalue);
+        unlock_account(acct_id, 1, acct_fd);
         fclose(fp);
         return -2;
     }
